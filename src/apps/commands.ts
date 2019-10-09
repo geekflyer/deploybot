@@ -244,14 +244,26 @@ export async function deployCommit(
   }
 }
 
-async function handleAutoDeploy(context: Context) {
-  context.log.info("auto deploy: checking deployments");
+async function handleAutoDeploy(context: Context, ref: string) {
+  context.log.info(
+    logCtx(context, { ref }),
+    "auto deploy: checking deployments"
+  );
   try {
     const conf = await config(context.github, context.repo());
-    for (const key in conf) {
+    await Promise.all(Object.keys(conf).map(async key => {
       const deployment = conf[key]!;
+      if (deployment.auto_deploy_on !== ref) {
+        context.log.info(
+          logCtx(context, { ref, target: key }),
+          "auto deploy: skipping target"
+        );
+        return;
+      }
+
+      // Will not throw an error here:
       await autoDeployTarget(context, key, deployment);
-    }
+    }));
   } catch (error) {
     if (error.code === 404) {
       context.log.info(logCtx(context, { error }), "auto deploy: no config");
@@ -397,20 +409,29 @@ export function commands({
 }) {
   const locker = lockStore();
 
-  const doAutoDeploy = (context: Context) => {
-    return locker.lock(`${context.payload.repository.id}-autodeploy`, () => {
-      return handleAutoDeploy(context);
-    });
+  const doAutoDeploy = (context: Context, ref: string) => {
+    const key = `${context.payload.repository.id}-${ref.replace(/\//g, "-")}-ad`;
+    context.log.info({ key }, "auto deploy: locked")
+    return locker.lock(key, () => handleAutoDeploy(context, ref));
   };
 
   app.on("push", async context => {
-    await doAutoDeploy(context);
+    await doAutoDeploy(context, context.payload.ref);
   });
   app.on("status", async context => {
-    await doAutoDeploy(context);
+    if (context.payload.state === "success") {
+      for (const branch of context.payload.branches) {
+        await doAutoDeploy(context, `refs/heads/${branch.name}`);
+      }
+    }
   });
   app.on("check_run", async context => {
-    await doAutoDeploy(context);
+    if (context.payload.check_run.status === "completed") {
+      await doAutoDeploy(
+        context,
+        `refs/heads/${context.payload.check_run.check_suite.head_branch}`
+      );
+    }
   });
   app.on("issue_comment.created", async context => {
     if (context.payload.comment.body.startsWith("/deploy")) {
